@@ -1,5 +1,7 @@
 from fastapi import APIRouter, Depends, Query
+from psycopg import Connection
 
+from app.database import get_db
 from app.deps import get_store, get_user
 from app.schemas import BookingIn, BookingOut, RatingIn, RescheduleIn
 from app.serializers import booking_out
@@ -29,11 +31,15 @@ def list_bookings(
     "", response_model=BookingOut, response_model_exclude_none=True, status_code=201
 )
 def create_booking(
-    body: BookingIn, user: User = Depends(get_user), store: Store = Depends(get_store)
+    body: BookingIn,
+    user: User = Depends(get_user),
+    store: Store = Depends(get_store),
+    conn: Connection = Depends(get_db),
 ):
     booking = booking_service.create_booking(
         store,
         user,
+        conn=conn,
         service_id=body.service_id,
         vehicle_id=body.vehicle_id,
         date=body.date,

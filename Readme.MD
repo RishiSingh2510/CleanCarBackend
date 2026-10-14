@@ -1,8 +1,8 @@
-# CleanCar API (FastAPI, in-memory database)
+# CleanCar API (FastAPI, PostgreSQL + in-memory state)
 
-Backend for the CleanCar mobile app. Everything is stored **in memory**: it's fast and needs no setup, but
-**all data is lost when the server restarts**, and it only works with **a single process** (one uvicorn worker).
-Great for development, demos and testing the app end to end — not for real customers (see "Going to production").
+Backend for the CleanCar mobile app. User accounts, vehicles, services and coupons use PostgreSQL (configured with
+`DATABASE_URL`). Sessions, password-reset tokens, bookings and slot state are stored **in memory**: those are lost
+when the server restarts, and the app only works with **a single process** (one uvicorn worker).
 
 ## Run it
 
@@ -86,9 +86,8 @@ python -m unittest discover -s tests -t . -v      # or: pytest
 
 ## Going to production — what this is NOT yet
 
-1. **Persistence.** Replace `app/store.py` and the three `app/services/*` modules' storage with a real database
-   (PostgreSQL + SQLAlchemy/SQLModel). The routers and business rules can stay. Until then, restart = data loss and you
-   can't run more than one worker/instance.
+1. **Persistence.** Move sessions, password-reset tokens, bookings and slot state from `app/store.py` into PostgreSQL
+   (or another shared store). Those in-memory parts are lost on restart and prevent running multiple workers/instances.
 2. **Payments.** `paymentRef` is stored but **not verified**. Integrate your gateway (create the order and verify the
    signature on the server) before marking a booking `paid`; also trigger real refunds on cancel (`refund_pending` today).
 3. **Password-reset delivery.** No email/SMS is sent; the token is only logged in development. Wire a provider into

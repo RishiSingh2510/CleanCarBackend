@@ -1,17 +1,18 @@
 import logging
 from contextlib import asynccontextmanager
 
-from app.config import get_settings
-from app.deps import get_store
-from app.errors import AppError
-from app.seed import seed_demo
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.config import get_settings
+from app.database import open_db
+from app.deps import get_store
+from app.errors import AppError
 from app.routers import account, auth, bookings, catalog, vehicles
+from app.seed import seed_demo
 
 settings = get_settings()
 log = logging.getLogger("cleancar")
@@ -27,14 +28,15 @@ async def lifespan(_: FastAPI):
             "CORS_ORIGINS is '*' in production — restrict it to your web origins."
         )
     if settings.seed_demo:
-        seed_demo(get_store())
+        with open_db() as conn:
+            seed_demo(get_store(), conn)
     yield
 
 
 app = FastAPI(
     title="CleanCar API",
     version="1.0.0",
-    description="In-memory backend for the CleanCar app. Data is lost when the server restarts.",
+    description="CleanCar API backed by PostgreSQL and in-memory booking/session state.",
     lifespan=lifespan,
     docs_url=None if settings.is_production else "/docs",
     redoc_url=None if settings.is_production else "/redoc",

@@ -1,10 +1,13 @@
 import re
 from typing import Any
 
-from app.domain.validation import clean_text
+from psycopg import Connection
+from psycopg.rows import dict_row
 
+from app.config import get_settings
+from app.domain.validation import clean_text
 from app.errors import AppError
-from app.store import Store, User, Vehicle, new_id
+from app.store import User, Vehicle, new_id
 
 _NUMBER = re.compile(r"^[A-Z0-9]{4,15}$")
 
@@ -28,72 +31,155 @@ def _clean(data: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _mine(store: Store, user: User) -> list[Vehicle]:
-    return [v for v in store.vehicles.values() if v.user_id == user.id]
+def _vehicle(row: dict[str, Any]) -> Vehicle:
+    return Vehicle(
+        id=str(row["id"]),
+        user_id=str(row["user_id"]),
+        brand=row["brand"],
+        model=row["model"],
+        number=row["number"],
+        fuel=row["fuel"],
+        type=row["type"],
+    )
 
 
-def list_vehicles(store: Store, user: User) -> list[Vehicle]:
-    with store.lock:
-        return _mine(store, user)
+def list_vehicles(conn: Connection, user: User) -> list[Vehicle]:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT id, user_id, brand, model, number, fuel, type
+            FROM public."Vehicles"
+            WHERE user_id = %s
+            ORDER BY id
+            """,
+            (user.id,),
+        )
+        rows = cur.fetchall()
+    return [_vehicle(row) for row in rows]
 
 
-def get_owned_vehicle(store: Store, user: User, vehicle_id: str) -> Vehicle:
-    with store.lock:
-        v = store.vehicles.get(vehicle_id)
-        if (
-            v is None or v.user_id != user.id
-        ):  # 404, not 403: don't reveal other people's ids
-            raise AppError(404, "VEHICLE_NOT_FOUND", "We couldn't find that vehicle.")
-        return v
+def get_owned_vehicle(conn: Connection, user: User, vehicle_id: str) -> Vehicle:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT id, user_id, brand, model, number, fuel, type
+            FROM public."Vehicles"
+            WHERE id = %s AND user_id = %s
+            """,
+            (vehicle_id, user.id),
+        )
+        row = cur.fetchone()
+    if row is None:  # 404, not 403: don't reveal other people's ids
+        raise AppError(404, "VEHICLE_NOT_FOUND", "We couldn't find that vehicle.")
+    return _vehicle(row)
 
 
-def create_vehicle(store: Store, user: User, data: dict[str, Any]) -> Vehicle:
+def create_vehicle(conn: Connection, user: User, data: dict[str, Any]) -> Vehicle:
     fields = _clean(data)
-    with store.lock:
-        mine = _mine(store, user)
-        if len(mine) >= store.settings.max_vehicles_per_user:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            'SELECT COUNT(*) AS count FROM public."Vehicles" WHERE user_id = %s',
+            (user.id,),
+        )
+        count = cur.fetchone()["count"]
+        if count >= get_settings().max_vehicles_per_user:
             raise AppError(
                 409,
                 "VEHICLE_LIMIT",
-                f"You can save up to {store.settings.max_vehicles_per_user} cars.",
+                f"You can save up to {get_settings().max_vehicles_per_user} cars.",
             )
-        if any(v.number == fields["number"] for v in mine):
+        cur.execute(
+            """
+            SELECT EXISTS(
+                SELECT 1 FROM public."Vehicles"
+                WHERE user_id = %s AND number = %s
+            ) AS is_duplicate
+            """,
+            (user.id, fields["number"]),
+        )
+        if cur.fetchone()["is_duplicate"]:
             raise AppError(
                 409, "VEHICLE_EXISTS", "You have already saved a car with this number."
             )
-        v = Vehicle(id=new_id(), user_id=user.id, **fields)
-        store.vehicles[v.id] = v
-        return v
+        cur.execute(
+            """
+            INSERT INTO public."Vehicles" (id, user_id, brand, model, number, fuel, type)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id, user_id, brand, model, number, fuel, type
+            """,
+            (
+                new_id(),
+                user.id,
+                fields["brand"],
+                fields["model"],
+                fields["number"],
+                fields["fuel"],
+                fields["type"],
+            ),
+        )
+        row = cur.fetchone()
+    return _vehicle(row)
 
 
 def update_vehicle(
-    store: Store, user: User, vehicle_id: str, patch: dict[str, Any]
+    conn: Connection, user: User, vehicle_id: str, patch: dict[str, Any]
 ) -> Vehicle:
-    with store.lock:
-        v = get_owned_vehicle(store, user, vehicle_id)
-        merged = {
-            "brand": v.brand,
-            "model": v.model,
-            "number": v.number,
-            "fuel": v.fuel,
-            "type": v.type,
-            **{k: val for k, val in patch.items() if val is not None},
-        }
-        fields = _clean(merged)
-        if any(
-            o.number == fields["number"] and o.id != v.id for o in _mine(store, user)
-        ):
+    vehicle = get_owned_vehicle(conn, user, vehicle_id)
+    merged = {
+        "brand": vehicle.brand,
+        "model": vehicle.model,
+        "number": vehicle.number,
+        "fuel": vehicle.fuel,
+        "type": vehicle.type,
+        **{key: value for key, value in patch.items() if value is not None},
+    }
+    fields = _clean(merged)
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT EXISTS(
+                SELECT 1 FROM public."Vehicles"
+                WHERE user_id = %s AND number = %s AND id <> %s
+            ) AS is_duplicate
+            """,
+            (user.id, fields["number"], vehicle.id),
+        )
+        if cur.fetchone()["is_duplicate"]:
             raise AppError(
                 409, "VEHICLE_EXISTS", "You have already saved a car with this number."
             )
-        for k, val in fields.items():
-            setattr(v, k, val)
-        return v
+        cur.execute(
+            """
+            UPDATE public."Vehicles"
+            SET brand = %s, model = %s, number = %s, fuel = %s, type = %s
+            WHERE id = %s AND user_id = %s
+            RETURNING id, user_id, brand, model, number, fuel, type
+            """,
+            (
+                fields["brand"],
+                fields["model"],
+                fields["number"],
+                fields["fuel"],
+                fields["type"],
+                vehicle_id,
+                user.id,
+            ),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise AppError(404, "VEHICLE_NOT_FOUND", "We couldn't find that vehicle.")
+    return _vehicle(row)
 
 
-def delete_vehicle(store: Store, user: User, vehicle_id: str) -> None:
-    with store.lock:
-        v = get_owned_vehicle(store, user, vehicle_id)
-        del store.vehicles[
-            v.id
-        ]  # existing bookings keep their own copy of the car details
+def delete_vehicle(conn: Connection, user: User, vehicle_id: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM public."Vehicles"
+            WHERE id = %s AND user_id = %s
+            RETURNING id
+            """,
+            (vehicle_id, user.id),
+        )
+        if cur.fetchone() is None:
+            raise AppError(404, "VEHICLE_NOT_FOUND", "We couldn't find that vehicle.")

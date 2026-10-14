@@ -80,7 +80,7 @@ class RatingIn(CamelModel):
 
 
 class QuoteIn(CamelModel):
-    service_id: str = Field(max_length=20)
+    service_id: str = Field(max_length=200)
     coupon_code: str | None = Field(default=None, max_length=50)
 
 
@@ -104,7 +104,7 @@ class AuthOut(CamelModel):
 class ServiceOut(CamelModel):
     id: str
     title: str
-    desc: str
+    description: str
     price: int
     duration_minutes: int
 

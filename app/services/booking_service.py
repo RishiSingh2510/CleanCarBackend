@@ -2,11 +2,12 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Any
 
+from psycopg import Connection
+
 from app.domain.catalog import ADDRESS_LABELS, PAYMENT_METHODS, TIME_SLOTS
 from app.domain.pricing import build_quote
 from app.domain.scheduling import display_status, parse_date, scheduled_at
 from app.domain.validation import clean_text
-
 from app.errors import AppError
 from app.services import vehicle_service
 from app.store import Booking, Store, User
@@ -117,6 +118,7 @@ def create_booking(
     store: Store,
     user: User,
     *,
+    conn: Connection,
     service_id: str,
     vehicle_id: str,
     date: str,
@@ -141,7 +143,7 @@ def create_booking(
         )
 
     with store.lock:
-        vehicle = vehicle_service.get_owned_vehicle(store, user, vehicle_id)
+        vehicle = vehicle_service.get_owned_vehicle(conn, user, vehicle_id)
         now = store.now()
         _check_slot(store, date, time, now, vehicle_id=vehicle.id)
         booking = Booking(

@@ -1,9 +1,13 @@
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Any
 
+from psycopg import Connection
+from psycopg.rows import dict_row
+
+from app.domain.scheduling import IST
 from app.domain.validation import validate_identifier, validate_name, validate_password
-
 from app.errors import AppError
 from app.security import (
     DUMMY_HASH,
@@ -56,28 +60,80 @@ def _revoke_all_sessions(store: Store, user_id: str) -> None:
         del store.sessions[key]
 
 
-def register(store: Store, name: str, identifier: str, password: str) -> AuthResult:
+def _user(row: dict[str, Any]) -> User:
+    created_at = row["created_at"]
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=IST)
+    return User(
+        id=str(row["id"]),
+        name=row["name"],
+        identifier=row["identifier"],
+        password_hash=row["password_hash"],
+        created_at=created_at,
+    )
+
+
+def _get_user_by_identifier(conn: Connection, identifier: str) -> User | None:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT id, name, identifier, password_hash, created_at
+            FROM public."Users"
+            WHERE identifier = %s
+            """,
+            (identifier,),
+        )
+        row = cur.fetchone()
+    return _user(row) if row is not None else None
+
+
+def _get_user_by_id(conn: Connection, user_id: str) -> User | None:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT id, name, identifier, password_hash, created_at
+            FROM public."Users"
+            WHERE id = %s
+            """,
+            (user_id,),
+        )
+        row = cur.fetchone()
+    return _user(row) if row is not None else None
+
+
+def register(
+    conn: Connection, store: Store, name: str, identifier: str, password: str
+) -> AuthResult:
     name = validate_name(name)
     ident = validate_identifier(identifier)
     validate_password(password)
     pw_hash = hash_password(password)  # slow on purpose — done before taking the lock
 
-    with store.lock:
-        if ident in store.user_ids_by_identifier:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT EXISTS(
+                SELECT 1 FROM public."Users" WHERE identifier = %s
+            ) AS account_exists
+            """,
+            (ident,),
+        )
+        if cur.fetchone()["account_exists"]:
             raise AppError(
                 409,
                 "ACCOUNT_EXISTS",
                 "An account with this email or phone number already exists. Try logging in.",
             )
-        user = User(
-            id=new_id(),
-            name=name,
-            identifier=ident,
-            password_hash=pw_hash,
-            created_at=store.now(),
+        cur.execute(
+            """
+            INSERT INTO public."Users" (id, name, identifier, password_hash, created_at)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id, name, identifier, password_hash, created_at
+            """,
+            (new_id(), name, ident, pw_hash, store.now()),
         )
-        store.users[user.id] = user
-        store.user_ids_by_identifier[ident] = user.id
+        user = _user(cur.fetchone())
+    with store.lock:
         return _issue_session(store, user)
 
 
@@ -101,15 +157,17 @@ def _check_lockout(store: Store, ident: str, now: datetime) -> None:
         )
 
 
-def login(store: Store, identifier: str, password: str) -> AuthResult:
+def login(
+    conn: Connection, store: Store, identifier: str, password: str
+) -> AuthResult:
     ident = validate_identifier(identifier)
     if not password:
         raise AppError(422, "VALIDATION_ERROR", "Enter your password")
 
     with store.lock:
         _check_lockout(store, ident, store.now())
-        user = store.user_by_identifier(ident)
-        stored_hash = user.password_hash if user else DUMMY_HASH
+    user = _get_user_by_identifier(conn, ident)
+    stored_hash = user.password_hash if user else DUMMY_HASH
 
     ok = (
         verify_password(password, stored_hash) and user is not None
@@ -123,10 +181,10 @@ def login(store: Store, identifier: str, password: str) -> AuthResult:
                 401, "INVALID_CREDENTIALS", "Incorrect email/phone or password."
             )
         store.login_failures.pop(ident, None)
-        return _issue_session(store, user)  # type: ignore[arg-type]
+        return _issue_session(store, user)
 
 
-def authenticate(store: Store, token: str) -> Principal:
+def authenticate(conn: Connection, store: Store, token: str) -> Principal:
     key = hash_token(token)
     with store.lock:
         session = store.sessions.get(key)
@@ -145,7 +203,7 @@ def authenticate(store: Store, token: str) -> Principal:
                 "Your session has expired. Please sign in again.",
                 {"WWW-Authenticate": "Bearer"},
             )
-        user = store.users.get(session.user_id)
+        user = _get_user_by_id(conn, session.user_id)
         if user is None:
             del store.sessions[key]
             raise AppError(
@@ -162,15 +220,31 @@ def logout(store: Store, principal: Principal) -> None:
         store.sessions.pop(principal.token_hash, None)
 
 
-def update_name(store: Store, user: User, name: str) -> User:
+def update_name(conn: Connection, user: User, name: str) -> User:
     clean = validate_name(name)
-    with store.lock:
-        user.name = clean
-        return user
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            UPDATE public."Users"
+            SET name = %s
+            WHERE id = %s
+            RETURNING id, name, identifier, password_hash, created_at
+            """,
+            (clean, user.id),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise AppError(404, "ACCOUNT_NOT_FOUND", "We couldn't find that account.")
+    return _user(row)
 
 
-def delete_account(store: Store, user: User) -> None:
+def delete_account(conn: Connection, store: Store, user: User) -> None:
     """Removes the account and every piece of personal data tied to it."""
+    with conn.cursor() as cur:
+        cur.execute('DELETE FROM public."Vehicles" WHERE user_id = %s', (user.id,))
+        cur.execute('DELETE FROM public."Users" WHERE id = %s RETURNING id', (user.id,))
+        if cur.fetchone() is None:
+            raise AppError(404, "ACCOUNT_NOT_FOUND", "We couldn't find that account.")
     with store.lock:
         _revoke_all_sessions(store, user.id)
         for key in [k for k, t in store.reset_tokens.items() if t.user_id == user.id]:
@@ -179,16 +253,15 @@ def delete_account(store: Store, user: User) -> None:
             del store.vehicles[vid]
         for bid in [b.id for b in store.bookings.values() if b.user_id == user.id]:
             del store.bookings[bid]
-        store.user_ids_by_identifier.pop(user.identifier, None)
         store.login_failures.pop(user.identifier, None)
         store.users.pop(user.id, None)
 
 
-def request_password_reset(store: Store, identifier: str) -> None:
+def request_password_reset(conn: Connection, store: Store, identifier: str) -> None:
     """Always succeeds silently so attackers can't discover which accounts exist."""
     ident = validate_identifier(identifier)
+    user = _get_user_by_identifier(conn, ident)
     with store.lock:
-        user = store.user_by_identifier(ident)
         if user is None:
             return
         token = new_token()
@@ -202,7 +275,9 @@ def request_password_reset(store: Store, identifier: str) -> None:
     # TODO(production): send `token` to the user by email/SMS instead of logging it.
 
 
-def reset_password(store: Store, token: str, new_password: str) -> None:
+def reset_password(
+    conn: Connection, store: Store, token: str, new_password: str
+) -> None:
     validate_password(new_password)
     pw_hash = hash_password(new_password)
     key = hash_token(token)
@@ -213,12 +288,16 @@ def reset_password(store: Store, token: str, new_password: str) -> None:
             raise AppError(
                 400, "INVALID_RESET_TOKEN", "This reset link is invalid or has expired."
             )
-        user = store.users.get(entry.user_id)
+        user = _get_user_by_id(conn, entry.user_id)
         del store.reset_tokens[key]
         if user is None:
             raise AppError(
                 400, "INVALID_RESET_TOKEN", "This reset link is invalid or has expired."
             )
-        user.password_hash = pw_hash
+        with conn.cursor() as cur:
+            cur.execute(
+                'UPDATE public."Users" SET password_hash = %s WHERE id = %s',
+                (pw_hash, user.id),
+            )
         store.login_failures.pop(user.identifier, None)
         _revoke_all_sessions(store, user.id)  # sign out everywhere

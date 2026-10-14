@@ -25,23 +25,23 @@ def auth_out(r: AuthResult) -> dict[str, Any]:
 
 def service_out(s: Service) -> dict[str, Any]:
     return {
-        "id": s.id,
-        "title": s.title,
-        "desc": s.desc,
-        "price": s.price,
-        "durationMinutes": s.duration_minutes,
+        "id": str(s["id"]),
+        "title": s["title"],
+        "description": s["description"],
+        "price": float(s["price"]),
+        "durationMinutes": s["duration_minutes"],
     }
 
 
 def coupon_out(c: Coupon) -> dict[str, Any]:
     return {
-        "code": c.code,
-        "title": c.title,
-        "desc": c.desc,
-        "type": c.type,
-        "value": c.value,
-        "maxDiscount": c.max_discount,
-        "minOrder": c.min_order,
+        "code": str(c["code"]),
+        "title": c["title"],
+        "desc": c["desc"],
+        "type": c["type"],
+        "value": float(c["value"]),
+        "maxDiscount": c["max_discount"],
+        "minOrder": c["min_order"],
     }
 
 
